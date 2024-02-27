@@ -1,0 +1,533 @@
+---
+title: "Notes"
+output: html_notebook
+---
+
+```{r setup, echo = FALSE}
+pkgs = c("tidyr", "dplyr", "ggplot2", "rstanarm", "kableExtra", "rnoaa", "tidyverse", "zoo", "bayesplot", "broom")
+lapply(pkgs, library, character.only = TRUE)
+```
+
+
+# The problem
+
+What is the unknown?
+
+- 5 days of year of 2024 that correspond to the bloom dates for cherry blossoms for 5 different locations:
+    - Washington DC, Liestal, Kyoto, Vancouver, and NYC
+- Prediction intervals for these 5 days
+
+What are conditions
+
+- csv file for prediction
+- Narrative (Quarto file)
+- git repo
+
+What are data?
+
+Available
+
+- for the five main sites:
+    - All except NYC: a csv file with, location, long, lat, altitude, year of observation, bloom date and bloom doy. 
+- Other locations
+    - Switzerland
+    - Japan
+    - South korea
+    - USA (?) -> need to clean
+    
+Need to look for
+
+- NYC
+- Weather (temp) data for these locations
+
+## Data so far
+
+Quick look into 4 locations
+
+```{r load data}
+df <- read.csv("data/washingtondc.csv") %>% 
+  bind_rows(read.csv("data/liestal.csv")) %>% 
+  bind_rows(read.csv("data/kyoto.csv")) %>% 
+  bind_rows(read.csv("data/vancouver.csv")) %>%
+  as.data.frame()
+
+```
+
+
+Some quick summary about locations
+```{r}
+location = c("Kyoto", "Liestal", "DC", "Vancouver", "NYC")
+lat = c(35, 47, 39, 49, 41)
+long = c(136, 8, -77, -123, -74)
+alt = c(44, 350, 0, 24, 8.5)
+
+table = cbind (location, lat, long, alt)
+
+knitr::kable(table) %>%
+  kable_styling()
+```
+
+
+By location
+
+```{r}
+
+ggplot(df, aes(y = bloom_doy, x = location))+
+  geom_boxplot()
+
+
+```
+
+Over the years
+
+```{r}
+
+ggplot(df, aes(y = bloom_doy, x = year))+
+  geom_smooth()+
+  facet_grid(rows = "location")
+
+
+```
+
+
+Decline over recent years...
+
+is it normally distributed?
+
+```{r}
+
+df %>%
+  filter(location == "kyoto")%>%
+  ggplot(aes(x = bloom_doy))+
+  geom_density()
+
+```
+
+
+
+```{r}
+df %>%
+  filter(location == "liestal")%>%
+  ggplot(aes(x = bloom_doy))+
+  geom_density()
+
+```
+
+```{r}
+df %>%
+  filter(location == "washingtondc")%>%
+  ggplot(aes(x = bloom_doy))+
+  geom_density()
+```
+
+
+Perhaps can use normal regression for simplicity. Heavier tails for places witho only recent data most likely due to warming. Likely that distribution can be treated as normal given temperature
+
+- Should be IID given one years bloom should not affect next years bloom
+- predictors would be temperature
+- Hierarchical gouped by location.
+    - Or maybe use as predictors instead given we have empty data sets of NY and Vancouver... Lat, long and altitude need to be taken into consideration.
+    
+# getting temperature data
+
+Lets first look at kyoto
+
+```{r kyoto temp}
+temp_kyoto <- 
+  ghcnd_search(stationid = "JA000047759",
+               var = c("tmax", "tmin"),
+               date_min = "1946-01-01",
+               date_max = "2024-02-16") %>%
+  reduce(left_join) %>%
+  mutate(tmax = na.approx(tmax))%>%
+  mutate(tmin = c(na.approx(tmin),4.8,4.8))%>%
+  transmute(year = parse_number(format(date, "%Y")), 
+            date, 
+            tmax = tmax / 10, 
+            tmin = tmin / 10, 
+            temp = (tmax + tmin) / 2)
+
+kyoto = filter(df, year >= 1951, location == "kyoto")
+
+get_temp_day = function(x, temps){
+  temp_year = filter(temps, year == x)
+  temp_year_wide = pivot_wider(temp_year[1:50,-1],  names_from = date, values_from = c(tmax, tmin, temp))
+  temp_year_wide = as.data.frame(temp_year_wide)
+  
+  return((temp_year_wide))
+}
+
+years = kyoto$year
+
+temps_list = lapply(years, get_temp_day, temps = temp_kyoto) 
+temps_df = as.data.frame(matrix(unlist(temps_list), nrow = 73, ncol =150, byrow= TRUE))
+names(temps_df)= c(paste0("tmax", 1:50), paste0("tmin", 1:50), paste0("temp", 1:50))
+
+kyoto = cbind(kyoto, temps_df)
+
+kyoto = mutate(kyoto, cumtemp = rowSums(kyoto[,108:157]))
+
+ggplot(kyoto, aes(x = cumtemp, y=bloom_doy))+
+  geom_smooth(method = "lm")+
+  geom_point()
+
+```
+Correlation appears to be light based on solely cumulative temperature... 
+
+```{r}
+cor(kyoto$bloom_doy[-55], kyoto$cumtemp[-55],method = "pearson")
+```
+
+For middle temperature
+
+```{r}
+kyoto_longer = pivot_longer(kyoto, cols = c(108:157), names_to = "day", values_to = "temp")
+
+ggplot(kyoto_longer, aes(x = temp, y=bloom_doy))+
+  geom_smooth(method = "lm")+
+  facet_wrap("day")
+
+```
+
+For lowest temperature
+
+```{r}
+kyoto_longer_2 = pivot_longer(kyoto, cols = c(58:107), names_to = "day", values_to = "mintemp")
+
+ggplot(kyoto_longer_2, aes(x = mintemp, y=bloom_doy))+
+  geom_smooth(method = "lm")+
+  facet_wrap("day")
+
+```
+
+maximum temp:
+
+```{r}
+kyoto_longer_3 = pivot_longer(kyoto, cols = c(8:57), names_to = "day", values_to = "maxtemp")
+
+ggplot(kyoto_longer_3, aes(x = maxtemp, y=bloom_doy))+
+  geom_smooth(method = "lm")+
+  facet_wrap("day")
+
+```
+
+Correlation appears to be positive for the first 5 days or so:
+
+```{r}
+
+kyoto_remove_na = kyoto[-55,]
+corr = lapply(kyoto_remove_na[,108:157], cor, y = kyoto_remove_na$bloom_doy)
+
+corr = unlist(corr)
+
+corr = as.data.frame(cbind(corr, 1:50))
+names(corr) = c("corr", "doy")
+
+ggplot(corr, aes (x = doy, y = corr))+
+  geom_point()+
+  geom_line()+
+  geom_smooth()
+
+```
+
+Seems like there is a weird trend where the correleation goes, down, up then down again...
+
+
+See if repeateable for liestal and dc:
+
+DC:
+
+```{r}
+temp = read.csv("./data/weather.csv")
+temp_DC = filter(temp, STATION == "USC00186350")%>%
+  mutate(DATE = as.Date(DATE, format = "%d/%m/%Y"),
+         TMAX = na.approx(TMAX),
+         TMIN = na.approx(TMIN))%>%
+  transmute(year = parse_number(format(DATE, "%Y")), 
+            date = DATE,
+            tmax = TMAX,
+            tmin = TMIN,
+            temp = (TMAX + TMIN) / 2,)
+
+DC = filter(df, year >= 1948, location == "washingtondc")
+
+
+years = DC$year
+
+temps_list = lapply(years, get_temp_day, temps = temp_DC) 
+temps_df = as.data.frame(matrix(unlist(temps_list), nrow = 76, ncol =150, byrow= TRUE))
+names(temps_df)= c(paste0("tmax", 1:50), paste0("tmin", 1:50), paste0("temp", 1:50))
+
+DC = cbind(DC, temps_df)
+
+DC = mutate(DC, cumtemp = rowSums(DC[,108:157]))
+
+ggplot(DC[-1,], aes(x = cumtemp, y=bloom_doy))+
+  geom_smooth(method = "lm")+
+  geom_point()
+```
+
+Correlation appears to be light based on solely cumulative temperature... 
+
+```{r}
+cor(DC$bloom_doy[-c(1,55)], DC$cumtemp[-c(1,55)],method = "pearson")
+```
+
+For middle temperature
+
+```{r}
+DC_longer = pivot_longer(DC[-1,], cols = c(108:157), names_to = "day", values_to = "temp")
+
+ggplot(DC_longer, aes(x = temp, y=bloom_doy))+
+  geom_smooth(method = "lm")+
+  facet_wrap("day")
+
+```
+
+For lowest temperature
+
+```{r}
+DC_longer_2 = pivot_longer(DC[-1,], cols = c(58:107), names_to = "day", values_to = "mintemp")
+
+ggplot(DC_longer_2, aes(x = mintemp, y=bloom_doy))+
+  geom_smooth(method = "lm")+
+  facet_wrap("day")
+
+```
+
+maximum temp:
+
+```{r}
+DC_longer_3 = pivot_longer(DC[-1,], cols = c(8:57), names_to = "day", values_to = "maxtemp")
+
+ggplot(DC_longer_3, aes(x = maxtemp, y=bloom_doy))+
+  geom_smooth(method = "lm")+
+  facet_wrap("day")
+
+```
+
+Correlation appears different than that of Kyoto in the first few DOYs but similar otherwise with the curve up at the middle.
+
+```{r}
+
+DC_remove_na = DC[-c(1,55),]
+corr = lapply(DC_remove_na[,108:157], cor, y = DC_remove_na$bloom_doy)
+
+corr = unlist(corr)
+
+corr = as.data.frame(cbind(corr, 1:50))
+names(corr) = c("corr", "doy")
+
+ggplot(corr, aes (x = doy, y = corr))+
+  geom_point()+
+  geom_line()+
+  geom_smooth()
+
+```
+
+
+# Build model
+
+Step 1 clean data
+
+```{r}
+temp = read.csv("./data/weather.csv")
+
+# function to arrange temp data into dataframe by year from day 1:50
+get_temp_day = function(x, temps){
+  temp_year = filter(temps, year == x)
+  temp_year_wide = pivot_wider(temp_year[1:50,-1],  names_from = date, values_from = temp)
+  temp_year_wide = as.data.frame(temp_year_wide)
+  
+  return((temp_year_wide))
+}
+
+# function to patch together temp data with bloom data
+combine_temp_data = function(stationid, loc, tavg = FALSE){
+
+  if(tavg == FALSE){
+  temp_data = filter(temp, STATION == stationid)%>%
+  mutate(DATE = as.Date(DATE, format = "%d/%m/%Y"),
+         TMAX = na.approx(TMAX),
+         TMIN = na.approx(TMIN))%>%
+  transmute(year = parse_number(format(DATE, "%Y")), 
+            date = DATE,
+            temp = (TMAX + TMIN) / 2)
+  }else{temp_data = filter(temp, STATION == stationid)%>%
+  mutate(DATE = as.Date(DATE, format = "%d/%m/%Y"),
+         TAVG = na.approx(TAVG))%>%
+  transmute(year = parse_number(format(DATE, "%Y")), 
+            date = DATE,
+            temp = TAVG)}
+
+station = filter(df, year >= temp_data$year[1], location == loc)
+
+
+years = station$year
+
+temps_list = lapply(years, get_temp_day, temps = temp_data) 
+temps_df = as.data.frame(matrix(unlist(temps_list), nrow = length(temps_list), ncol =50, byrow= TRUE))
+names(temps_df)= c(paste0("temp_doy_", 1:50))
+
+bloom_temp = cbind(station, temps_df)
+return(bloom_temp)
+}
+
+
+vancouver = combine_temp_data(stationid = "CA001108395", loc = "vancouver", tavg = TRUE)
+dc = combine_temp_data(stationid = "USC00186350", loc = "washingtondc")
+kyoto = combine_temp_data(stationid = "JA000047759", loc = "kyoto")
+liestal = combine_temp_data(stationid = "Liestal", loc = "liestal", tavg = TRUE)
+
+df_combined = na.omit(rbind (vancouver, dc, kyoto, liestal))
+
+
+df_combined_longer = pivot_longer(df_combined[-1,], cols = c(8:57), names_to = "day", values_to = "temp")
+
+ggplot(df_combined_longer, aes(x = temp, y=bloom_doy))+
+  geom_smooth(method = "lm")+
+  geom_point(size = 0.1)+
+  facet_wrap("day")
+
+```
+
+
+correlations
+
+```{r}
+corr = lapply(df_combined[,8:57], cor, y = df_combined$bloom_doy)
+
+corr = unlist(corr)
+
+corr = as.data.frame(cbind(corr, 1:50))
+names(corr) = c("corr", "doy")
+
+ggplot(corr, aes (x = doy, y = corr))+
+  geom_point()+
+  geom_smooth(se = FALSE)
+
+```
+
+
+# Build the model
+
+
+## specifiying the model
+
+predictors will be location and temperature of each bloom doy
+
+we use a weakly informative prior: 
+
+sd and mean of each bloom doy by location:
+
+```{r}
+summary = 
+  df_combined %>%
+  group_by(location)%>%
+  summary()
+print(summary)
+```
+
+
+```{r}
+
+ggplot(df_combined, aes(x = temp_doy_1, y=bloom_doy))+
+  geom_smooth(method = "lm")+
+  geom_point(size = 1)
+```
+
+model:
+
+```{r}
+
+set.seed(1) 
+model = stan_glm(
+  bloom_doy ~ location + temp_doy_1 + temp_doy_2 + temp_doy_3 + temp_doy_4 + temp_doy_5 + temp_doy_6 + temp_doy_7 + temp_doy_8 + temp_doy_9 + temp_doy_10 + temp_doy_11 + temp_doy_12 + temp_doy_13 + temp_doy_14 + temp_doy_15 + temp_doy_16 + temp_doy_17 + temp_doy_18 + temp_doy_19 + temp_doy_20 + temp_doy_21 + temp_doy_22 + temp_doy_23 + temp_doy_24 + temp_doy_25 + temp_doy_26 + temp_doy_27 + temp_doy_28 + temp_doy_29 + temp_doy_30 + temp_doy_31 + temp_doy_32 + temp_doy_33 + temp_doy_34 + temp_doy_35 + temp_doy_36 + temp_doy_37 + temp_doy_38 + temp_doy_39 + temp_doy_40 + temp_doy_41 + temp_doy_42 + temp_doy_43 + temp_doy_44 + temp_doy_45 + temp_doy_46 + temp_doy_47 + temp_doy_48 + temp_doy_49 + temp_doy_50, 
+  data = df_combined, family = "gaussian",
+  prior_intercept = normal(102, 10),
+  prior = normal(-0.2, 20, autoscale = TRUE),
+  prior_aux = exponential(1/10, autoscale = TRUE),
+  chains = 4, iter = 5000*2)
+  
+
+```
+
+Diagnostics
+
+```{r}
+mcmc_trace(model, size = 0.1)
+mcmc_dens_overlay(model)
+mcmc_acf(model)
+```
+Looks good!
+
+
+summary stats:
+
+```{r}
+model$coefficients
+model$ses
+model$stan_summary
+```
+Prediction:
+
+get data:
+
+```{r}
+
+get2024_temp = function(stationid, loc, tavg = FALSE){
+
+  if(tavg == FALSE){
+  temp_data = filter(temp, STATION == stationid)%>%
+  mutate(DATE = as.Date(DATE, format = "%d/%m/%Y"),
+         TMAX = na.approx(TMAX),
+         TMIN = na.approx(TMIN))%>%
+  transmute(year = parse_number(format(DATE, "%Y")), 
+            date = DATE,
+            temp = (TMAX + TMIN) / 2)
+  }else{temp_data = filter(temp, STATION == stationid)%>%
+  mutate(DATE = as.Date(DATE, format = "%d/%m/%Y"),
+         TAVG = na.approx(TAVG))%>%
+  transmute(year = parse_number(format(DATE, "%Y")), 
+            date = DATE,
+            temp = TAVG)}
+
+
+
+temps_df = get_temp_day(2024, temp_data)
+names(temps_df)= c(paste0("temp_doy_", 1:50))
+
+return(temps_df)
+
+}
+
+
+vancouver = get2024_temp(stationid = "CA001108395", tavg = TRUE)
+dc = get2024_temp(stationid = "USC00186350")
+dc[50] = dc[49]
+kyoto = get2024_temp(stationid = "JA000047759")
+liestal = get2024_temp(stationid = "Liestal", tavg = TRUE)
+nyc = get2024_temp(stationid ="USW00094728" )
+
+predict_set = rbind(vancouver, dc, kyoto, liestal, nyc)
+location = c("vancouver", "washingtondc", "kyoto", "liestal", "washingtondc")
+predict_set = cbind(location, predict_set)
+
+
+```
+
+predict:
+
+```{r}
+prediction = posterior_predict(
+  model,
+  newdata = predict_set
+)
+
+print(c(mean(prediction[,1]), mean(prediction[,2]), mean(prediction[,3]), mean(prediction[,4]), mean(prediction[,5])))
+
+
+
+
+```
+
